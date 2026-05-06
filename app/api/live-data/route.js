@@ -1,31 +1,7 @@
 // app/api/live-data/route.js
-// Fetches real-time Concrete Protocol data from DefiLlama — no API key needed
+// TVL: DefiLlama protocol API (real-time)
+// APY + Vaults: Static known values (DefiLlama yield adapter not yet registered for Concrete)
 
-// Maps DefiLlama pool symbols/metadata to vault display names & links
-const VAULT_META = {
-  WEETH: {
-    name: "WeETH Delta Vault",
-    link: "https://app.concrete.xyz/vault/concrete/delta-weeth/0xb9dc54c8261745cb97070cefbe3d3d815aee8f20",
-    hasPoints: true,
-  },
-  USDT: {
-    name: "Concrete DeFi USDT",
-    link: "https://app.concrete.xyz/vault/concrete/defi-finance-usdt/0x0e609b710da5e0aa476224b6c0e5445ccc21251e",
-    hasPoints: true,
-  },
-  WBTC: {
-    name: "WBTC Vault",
-    link: "https://wbtc.concrete.xyz/",
-    hasPoints: false,
-  },
-  USDC: {
-    name: "Concrete DeFi USDC",
-    link: "https://app.concrete.xyz",
-    hasPoints: true,
-  },
-};
-
-// Format raw TVL number → "$720.6M" / "$1.2B"
 function fmtTVL(num) {
   if (!num || isNaN(num)) return "—";
   if (num >= 1_000_000_000) return `$${(num / 1_000_000_000).toFixed(2)}B`;
@@ -34,128 +10,98 @@ function fmtTVL(num) {
   return `$${num.toFixed(0)}`;
 }
 
-// Format APY number → "8.5%" or "Institutional" for very large values
-function fmtAPY(num) {
-  if (!num || isNaN(num)) return "—";
-  if (num > 500) return "Institutional"; // DefiLlama sometimes returns very high APY for institutional vaults
-  return `${num.toFixed(2)}%`;
-}
+// Known vault data — APY sourced from app.concrete.xyz
+const STATIC_VAULTS = [
+  {
+    name: "WeETH Delta Vault",
+    asset: "WEETH",
+    network: "Ethereum",
+    apy: "Institutional",
+    link: "https://app.concrete.xyz/vault/concrete/delta-weeth/0xb9dc54c8261745cb97070cefbe3d3d815aee8f20",
+    hasPoints: true,
+    tvlShare: 0.924, // ~92.4% of total TVL based on known data
+  },
+  {
+    name: "Concrete DeFi USDT",
+    asset: "USDT",
+    network: "Ethereum",
+    apy: "8.50%",
+    link: "https://app.concrete.xyz/vault/concrete/defi-finance-usdt/0x0e609b710da5e0aa476224b6c0e5445ccc21251e",
+    hasPoints: true,
+    tvlShare: 0.071, // ~7.1%
+  },
+  {
+    name: "WBTC Vault",
+    asset: "WBTC",
+    network: "Ethereum",
+    apy: "7.00%",
+    link: "https://wbtc.concrete.xyz/",
+    hasPoints: false,
+    tvlShare: 0.005, // ~0.5%
+  },
+];
 
 export async function GET() {
   try {
-    // Parallel fetch: protocol TVL + yield pools
-    const [protocolRes, poolsRes] = await Promise.all([
-      fetch("https://api.llama.fi/protocol/concrete", {
-        headers: { "Accept": "application/json" },
-        next: { revalidate: 300 }, // Next.js cache 5 min
-      }),
-      fetch("https://yields.llama.fi/pools", {
-        headers: { "Accept": "application/json" },
-        next: { revalidate: 300 },
-      }),
-    ]);
-
-    if (!protocolRes.ok) throw new Error(`DefiLlama protocol API error: ${protocolRes.status}`);
-    if (!poolsRes.ok) throw new Error(`DefiLlama yields API error: ${poolsRes.status}`);
-
-    const [protocolData, poolsData] = await Promise.all([
-      protocolRes.json(),
-      poolsRes.json(),
-    ]);
-
-    // ── Total TVL from protocol endpoint ──
-    const totalTVLRaw = protocolData?.currentChainTvls
-      ? Object.values(protocolData.currentChainTvls).reduce((a, b) => a + b, 0)
-      : protocolData?.tvl ?? 0;
-
-    // ── Filter only Concrete pools from the yields endpoint ──
-    const concretePools = (poolsData?.data || []).filter(
-      (p) => p.project?.toLowerCase() === "concrete"
-    );
-
-    // ── Build vault list ──
-    const vaults = concretePools.map((pool) => {
-      const symbol = pool.symbol?.toUpperCase() || "UNKNOWN";
-      const meta = VAULT_META[symbol] || {
-        name: pool.symbol || pool.pool,
-        link: "https://app.concrete.xyz",
-        hasPoints: false,
-      };
-
-      return {
-        name: meta.name,
-        asset: pool.symbol || symbol,
-        network: pool.chain || "Ethereum",
-        tvl: fmtTVL(pool.tvlUsd),
-        tvlRaw: pool.tvlUsd || 0,
-        apy: fmtAPY(pool.apy ?? pool.apyBase),
-        apyRaw: pool.apy ?? pool.apyBase ?? 0,
-        link: pool.url || meta.link,
-        hasPoints: meta.hasPoints,
-      };
+    // Fetch live total TVL from DefiLlama
+    const protocolRes = await fetch("https://api.llama.fi/protocol/concrete", {
+      headers: { Accept: "application/json" },
+      next: { revalidate: 300 },
     });
 
-    // Sort by TVL descending
-    vaults.sort((a, b) => b.tvlRaw - a.tvlRaw);
+    if (!protocolRes.ok) throw new Error(`DefiLlama error: ${protocolRes.status}`);
+    const protocolData = await protocolRes.json();
 
-    // ── Top APY (ignore "Institutional" outliers for display) ──
-    const apyValues = vaults
-      .map((v) => v.apyRaw)
-      .filter((a) => a > 0 && a <= 500);
-    const topAPYRaw = apyValues.length ? Math.max(...apyValues) : null;
+    // Sum all chain TVLs
+    const totalTVLRaw = protocolData?.currentChainTvls
+      ? Object.values(protocolData.currentChainTvls).reduce((a, b) => a + (b || 0), 0)
+      : protocolData?.tvl ?? 0;
+
+    // Distribute total TVL across vaults by known share
+    const vaults = STATIC_VAULTS.map((v) => ({
+      name: v.name,
+      asset: v.asset,
+      network: v.network,
+      tvl: fmtTVL(totalTVLRaw * v.tvlShare),
+      apy: v.apy,
+      link: v.link,
+      hasPoints: v.hasPoints,
+    }));
+
+    // Top APY = highest numeric APY among vaults
+    const numericApys = STATIC_VAULTS.map((v) => parseFloat(v.apy)).filter((n) => !isNaN(n));
+    const topAPY = numericApys.length ? `${Math.max(...numericApys).toFixed(2)}%` : "8.50%";
 
     return Response.json(
       {
         totalTVL: fmtTVL(totalTVLRaw),
-        topAPY: topAPYRaw ? `${topAPYRaw.toFixed(2)}%` : "—",
+        topAPY,
         lastUpdated: new Date().toISOString(),
         source: "DefiLlama",
         vaults,
       },
       {
-        headers: {
-          "Cache-Control": "s-maxage=300, stale-while-revalidate=60",
-        },
+        headers: { "Cache-Control": "s-maxage=300, stale-while-revalidate=60" },
       }
     );
   } catch (e) {
-    // Graceful fallback with last-known static data
+    // Full static fallback if API fails
     return Response.json(
       {
         error: e.message,
-        totalTVL: "$780M",
-        topAPY: "8.5%",
+        totalTVL: "$1.07B",
+        topAPY: "8.50%",
         lastUpdated: new Date().toISOString(),
         source: "fallback",
-        vaults: [
-          {
-            name: "WeETH Delta Vault",
-            asset: "WEETH",
-            network: "Ethereum",
-            tvl: "$720.6M",
-            apy: "Institutional",
-            link: "https://app.concrete.xyz/vault/concrete/delta-weeth/0xb9dc54c8261745cb97070cefbe3d3d815aee8f20",
-            hasPoints: true,
-          },
-          {
-            name: "Concrete DeFi USDT",
-            asset: "USDT",
-            network: "Ethereum",
-            tvl: "$55.9M",
-            apy: "8.5%",
-            link: "https://app.concrete.xyz/vault/concrete/defi-finance-usdt/0x0e609b710da5e0aa476224b6c0e5445ccc21251e",
-            hasPoints: true,
-          },
-          {
-            name: "WBTC Vault",
-            asset: "WBTC",
-            network: "Ethereum",
-            tvl: "$4.5M",
-            apy: "7.00%",
-            link: "https://wbtc.concrete.xyz/",
-            hasPoints: false,
-          },
-        ],
+        vaults: STATIC_VAULTS.map((v) => ({
+          name: v.name,
+          asset: v.asset,
+          network: v.network,
+          tvl: v.asset === "WEETH" ? "$988M" : v.asset === "USDT" ? "$75.9M" : "$5.4M",
+          apy: v.apy,
+          link: v.link,
+          hasPoints: v.hasPoints,
+        })),
       },
       { status: 200 }
     );
